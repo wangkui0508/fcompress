@@ -1,0 +1,4 @@
+*.o
+test_fcompress
+bench_variants
+exp_ab
