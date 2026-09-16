@@ -2,14 +2,18 @@
  *
  * 两条编码路径, 共用同一套 min/step 计算:
  *
- *   fc_compress_neon     默认快路径. 量化在 f16 域完成:
- *                        (v-min)*inv 用 FSUB.8H/FMUL.8H, 再一条 FCVTNU.8H
- *                        直接得到 u16 (就近偶数+饱和), 每 8 元素 6 条指令.
- *                        比 f32 路径快约 1.9x, q 最多差 1 个 LSB.
- *                        两种情况下自动回退 f32 路径:
+ *   fc_compress_neon     默认快路径. 量化在 f16 域完成, 有两种形式:
+ *                          FMA 型 (默认): t = v*inv + bias, bias = -min*inv
+ *                                        预计算, 每 8 元素 5 条指令;
+ *                          sub+mul 型:   t = (v-min)*inv, 每 8 元素 6 条指令
+ *                                        (|min| 相对 range 太大时的回退).
+ *                        再一条 FCVTNU.8H 得到 u16 (就近偶数+饱和).
+ *                        比 f32 路径快约 2.2x, q 最多差 1 个 LSB.
+ *                        三种情况下自动回退 (a/b 回退到 f32, c 回退到 sub+mul):
  *                          a) 某列 step 小到 1/step 会溢出 f16;
  *                          b) 某列跨度 mx-min 超过 f16 最大值 (否则 f16 域里
- *                             v-min 会溢出成 inf, 顶部整段被饱和到 255).
+ *                             v-min 会溢出成 inf, 顶部整段被饱和到 255);
+ *                          c) 某列 |min| > 2*range, FMA 会抵消掉有效位.
  *
  *   fc_compress_neon_hp  高精度路径. 量化在 f32 域 (FCVTNU.4S + 饱和窄化),
  *                        与 fcompress_ref.c 逐位一致.
@@ -20,9 +24,10 @@
  * 指令要点:
  *   1) min/max 规约在 f16 域 (vminq_f16/vmaxq_f16), 精确无舍入; 每行 32 个
  *      f16 = 4 个 float16x8_t, 一趟扫描 + 4 组累加器即得全部 32 列的 min/max,
- *      不需要转置, 不需要水平规约. (拆成 8 组累加器打断链式依赖在本机实测
- *      无收益: vmin 延迟短, 4 组交错已经喂饱流水线, 反而多出寄存器压力 -
- *      完整 A/B 见 exp_ab.c)
+ *      不需要转置, 不需要水平规约. 扫描按 4 行展开 + 组内树形归约, 把依赖链
+ *      从 31 级压到 8 级 (实测 -5%, 完整 A/B 见 exp_opt.c).
+ *      (拆成 8 组累加器在本机实测无收益: vmin 延迟短, 4 组交错已经喂饱流水线,
+ *      反而多出寄存器压力 - 完整 A/B 见 exp_ab.c)
  *   2) step = (max-min)/255 用 vdivq_f32 (IEEE 精确) 再窄化存 f16.
  *      vdiv 在这里是免费的: 8 条独立的 VDIV.4S 延迟被后面 pass 2 的计算完全掩盖.
  *      实测换成 vrecpeq_f32+Newton 反而慢 1%, 换 vrecpeq_f16 则无法满足精度.
@@ -31,6 +36,13 @@
  *   4) 饱和链: FP->uint 转换对负数饱和到 0, vqmovn_u32/vqmovn_u16 再夹到 255,
  *      不需要任何显式 clamp. (ARMv8 无直接 f16->u32 转换的 ACLE intrinsic,
  *      但 f16->u16 有, 这正是快路径能成立的原因.)
+ *   5) 这个 kernel 是**访存受限**的, 不是浮点受限: 只读 pass 1 (2048B) 就要
+ *      ~20 ns, pass 2 (再读 2048B + 窄化 + 写 1024B) 要 ~32 ns, 而把 pass 1
+ *      的 256 条 FMIN/FMAX 全部删掉、或把 pass 2 的 FCVTNU 全部删掉, 耗时都
+ *      几乎不变 (见 exp_opt.c 的 P1/P2 与 exp_ld.c). 所以优化方向是:
+ *      少几条指令 + 把访存等得更快, 而不是"少几次浮点运算".
+ *      加载宽度不是越大越好: 实测 4x16B 比 1x64B (vld1q_f16_x4) 快 ~15%
+ *      (512 块工作集下 16.0 vs 18.6 ns), 所以保持 16B 加载.
  */
 #include "fcompress.h"
 
@@ -55,21 +67,35 @@
  * 有限, 只是损失 < 1 个 LSB, 不必回退. */
 #define FC_F16_MAX 65504.0f
 
-/* ---------- 一趟扫描求 32 列 min/max (f16 域, 精确) ---------- */
+/* 快路径守卫 3: FMA 量化用的 bias = -mn*inv 必须能有意义地装进 f16.
+ * 阈值 512 <=> |mn| <= 2.01*range (见 fc_compress_neon 里的推导).
+ * 触发后回退到 f16 的 sub+mul 量化, 只慢约 6%. */
+#define FC_FMA_BIAS_MAX 512.0f
+
+/* ---------- 一趟扫描求 32 列 min/max (f16 域, 精确) ----------
+ * 4 行展开 + 组内树形归约: 把 mn/mx 的串行依赖链从 31 级压到 8 级, 实测比
+ * 单行版本快 ~5% (见 exp_opt.c 的 OLD/U4 对照).
+ * 注意: 加载宽度不是越大越好 —— 实测 4x16B 比 1x64B(vld1q_f16_x4) 更快
+ * (512 块工作集下 16.0 vs 18.6 ns, 见 exp_ld.c), 所以这里保持 16B 加载. */
 static inline void fc_minmax(const float16_t *p, float16x8_t mn[4], float16x8_t mx[4])
 {
-    mn[0] = vld1q_f16(p + 0);
-    mn[1] = vld1q_f16(p + 8);
-    mn[2] = vld1q_f16(p + 16);
-    mn[3] = vld1q_f16(p + 24);
-    for (int g = 0; g < 4; g++) mx[g] = mn[g];
+    for (int g = 0; g < 4; g++) {
+        float16x8_t a = vld1q_f16(p + g * 8);
+        float16x8_t b = vld1q_f16(p + FC_N + g * 8);
+        float16x8_t c = vld1q_f16(p + 2 * FC_N + g * 8);
+        float16x8_t d = vld1q_f16(p + 3 * FC_N + g * 8);
+        mn[g] = vminq_f16(vminq_f16(a, b), vminq_f16(c, d));
+        mx[g] = vmaxq_f16(vmaxq_f16(a, b), vmaxq_f16(c, d));
+    }
 
-    for (int r = 1; r < FC_N; r++) {
-        const float16_t *row = p + r * FC_N;
+    for (int r = 4; r < FC_N; r += 4) {
         for (int g = 0; g < 4; g++) {
-            float16x8_t v = vld1q_f16(row + g * 8);
-            mn[g] = vminq_f16(mn[g], v);
-            mx[g] = vmaxq_f16(mx[g], v);
+            float16x8_t a = vld1q_f16(p + r * FC_N + g * 8);
+            float16x8_t b = vld1q_f16(p + (r + 1) * FC_N + g * 8);
+            float16x8_t c = vld1q_f16(p + (r + 2) * FC_N + g * 8);
+            float16x8_t d = vld1q_f16(p + (r + 3) * FC_N + g * 8);
+            mn[g] = vminq_f16(mn[g], vminq_f16(vminq_f16(a, b), vminq_f16(c, d)));
+            mx[g] = vmaxq_f16(mx[g], vmaxq_f16(vmaxq_f16(a, b), vmaxq_f16(c, d)));
         }
     }
 }
@@ -115,18 +141,44 @@ static void fc_quant_f32(const float16_t *p, fc_block *out, const float32x4_t lo
     }
 }
 
-/* ---------- f16 域量化: 每 8 元素 6 条指令 ---------- */
-static void fc_quant_f16(const float16_t *p, fc_block *out, const float16x8_t mn[4],
-                         const float16x8_t inv[4])
+/* ---------- f16 域量化, 两种形式 ----------
+ * 两版都把 4 组的 8 个 q 字节拼成一条 32B store (整行一次写回), 比 4 次
+ * vst1_u8 少 3 条 store; 实测 store 宽度本身不影响带宽, 但条数影响前端.
+ *
+ * (a) sub+mul 型: t = (v - mn) * inv, 每 8 元素 6 条指令. 精度与旧快路径
+ *     完全一致 (减法是 Sterbenz 精确的, 只有乘法有一次舍入).
+ * (b) FMA 型:    t = v * inv + bias, bias = -(mn * inv) 预计算,
+ *     每 8 元素 5 条指令 —— 省掉一条 FSUB.8H, 实测再快 5~6%.
+ *     FMA 的乘积不单独舍入, 所以唯一的新误差来源是 bias 被压进 f16:
+ *     |Δq| ≲ |mn*inv| * 2^-11 = 0.125 * |mn|/range 个量化台阶.
+ *     mn 相对 range 越大(大 DC 偏置) 抵消越严重, 故由守卫 3 把关. */
+static void fc_quant_f16_sub(const float16_t *p, fc_block *out, const float16x8_t mn[4],
+                             const float16x8_t inv[4])
 {
     for (int r = 0; r < FC_N; r++) {
         const float16_t *row = p + r * FC_N;
-        uint8_t *dst = out->q + r * FC_N;
-        for (int g = 0; g < 4; g++) {
-            float16x8_t v = vld1q_f16(row + g * 8);
-            float16x8_t t = vmulq_f16(vsubq_f16(v, mn[g]), inv[g]);
-            vst1_u8(dst + g * 8, vqmovn_u16(vcvtnq_u16_f16(t)));
-        }
+        uint8x16x2_t o;
+        o.val[0] = vqmovn_high_u16(
+            vqmovn_u16(vcvtnq_u16_f16(vmulq_f16(vsubq_f16(vld1q_f16(row + 0), mn[0]), inv[0]))),
+            vcvtnq_u16_f16(vmulq_f16(vsubq_f16(vld1q_f16(row + 8), mn[1]), inv[1])));
+        o.val[1] = vqmovn_high_u16(
+            vqmovn_u16(vcvtnq_u16_f16(vmulq_f16(vsubq_f16(vld1q_f16(row + 16), mn[2]), inv[2]))),
+            vcvtnq_u16_f16(vmulq_f16(vsubq_f16(vld1q_f16(row + 24), mn[3]), inv[3])));
+        vst1q_u8_x2(out->q + r * FC_N, o);
+    }
+}
+
+static void fc_quant_f16_fma(const float16_t *p, fc_block *out, const float16x8_t inv[4],
+                             const float16x8_t bias[4])
+{
+    for (int r = 0; r < FC_N; r++) {
+        const float16_t *row = p + r * FC_N;
+        uint8x16x2_t o;
+        o.val[0] = vqmovn_high_u16(vqmovn_u16(vcvtnq_u16_f16(vfmaq_f16(bias[0], vld1q_f16(row + 0), inv[0]))),
+                                   vcvtnq_u16_f16(vfmaq_f16(bias[1], vld1q_f16(row + 8), inv[1])));
+        o.val[1] = vqmovn_high_u16(vqmovn_u16(vcvtnq_u16_f16(vfmaq_f16(bias[2], vld1q_f16(row + 16), inv[2]))),
+                                   vcvtnq_u16_f16(vfmaq_f16(bias[3], vld1q_f16(row + 24), inv[3])));
+        vst1q_u8_x2(out->q + r * FC_N, o);
     }
 }
 
@@ -174,7 +226,25 @@ void fc_compress_neon(const fc_f16 *restrict in, fc_block *restrict out)
         e = vmulq_f16(vrecpsq_f16(step16[g], e), e);
         inv16[g] = vbslq_f16(vceqq_f16(step16[g], zero16), zero16, e);
     }
-    fc_quant_f16(p, out, mn, inv16);
+
+    /* 守卫 3: bias = -mn*inv 必须能"有意义地"装进 f16, 否则 v*inv 与 bias
+     * 相减会把有效位全抵消掉 (q 的整体平移 ≲ |mn*inv|*2^-11 个台阶).
+     * 取 |mn*inv| <= 512 —— 等价于 |mn| <= 2.01*range, 此时平移 ≤ 0.25 台阶,
+     * 与 sub+mul 版的精度不可区分 (实测两者 ΔSNR 都在 -0.2~-0.3 dB).
+     * step==0 (常量列) 时 bias=0, 不触发; mn*inv 溢出成 inf 时必然触发.
+     *
+     * 注意这里的回退目标是 f16 的 sub+mul 路径 (只慢 ~6%), 不是 f32 路径
+     * (慢 2.2x) —— 守卫 1/2 才是块级大惩罚, 守卫 3 只是让这一块从
+     * 49 ns 变成 54 ns, 不再制造"一个坏列拖垮整块"的双峰. */
+    float16x8_t bias[4], mag = zero16;
+    for (int g = 0; g < 4; g++) {
+        bias[g] = vnegq_f16(vmulq_f16(mn[g], inv16[g]));
+        mag = vmaxq_f16(mag, vabsq_f16(bias[g]));
+    }
+    if ((float)vmaxvq_f16(mag) > FC_FMA_BIAS_MAX)
+        fc_quant_f16_sub(p, out, mn, inv16);
+    else
+        fc_quant_f16_fma(p, out, inv16, bias);
 }
 
 void fc_compress_neon_hp(const fc_f16 *restrict in, fc_block *restrict out)

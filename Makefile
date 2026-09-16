@@ -17,6 +17,18 @@ bench_variants: bench_variants.c fcompress_neon.c fcompress.h
 variants: bench_variants
 	./bench_variants
 
+# 快路径优化前后 A/B + 收益归因 (OLD/NEW/U4/FMA/HP + pass1/pass2 诊断)
+exp_opt: exp_opt.c fcompress_neon.c fcompress_ref.c fcompress.h
+	$(CC) $(CFLAGS) -I. -o $@ exp_opt.c fcompress_neon.c fcompress_ref.c $(LDFLAGS)
+
+# 访存宽度微基准: 证明这个 kernel 是访存受限而不是浮点受限
+exp_ld: exp_ld.c fcompress.h
+	$(CC) $(CFLAGS) -I. -o $@ exp_ld.c $(LDFLAGS)
+
+.PHONY: opt
+opt: exp_opt
+	./exp_opt
+
 %.o: %.c fcompress.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -30,4 +42,4 @@ asm: fcompress_neon.c
 	$(CC) $(CFLAGS) -S -o - fcompress_neon.c | grep -E '^\s+(fmin|fmax|fmla|fmul|fsub|fdiv|ucvtf|fcvtn|fcvtl|xtn|shrn|ld1|st1)' | sort | uniq -c | sort -rn
 
 clean:
-	rm -f $(OBJS) test_fcompress bench_variants
+	rm -f $(OBJS) test_fcompress bench_variants exp_opt exp_ld

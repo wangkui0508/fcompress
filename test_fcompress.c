@@ -51,6 +51,13 @@ static void gen(fc_f16 *m, uint64_t seed, int pattern)
         case 6: base = -32752.0; range = 65504.0; break;  /* 满量程, 恰好在边界上 */
         case 7: base = -60000.0; range = 120000.0; break; /* range = 120000 */
         case 8: base = -65504.0; range = 131008.0; break; /* f16 全域, range 最大 */
+        /* 守卫 3 的边界: |min*inv| 落在 [400, 512] —— 恰好还在 FMA 快路径上,
+         * 但 bias 的 f16 舍入已经接近最大 (整列 q 最多平移 0.25 个台阶).
+         * 覆盖"FMA 抵消"最坏情况, 40 万块实测 max|Δq| = 1, 最差 ΔSNR -0.57 dB */
+        case 9:
+            base = ((c & 1) ? -1.0 : 1.0) * (1.5 + 0.7 * (double)(c % 5) / 4.0) * (0.25 + 8.0 * (double)((c / 5) % 4) / 3.0);
+            range = 0.25 + 8.0 * (double)((c / 5) % 4) / 3.0;
+            break;
         default: base = 3.0; range = 1e-2; break;
         }
         for (int r = 0; r < FC_N; r++) {
@@ -104,7 +111,7 @@ int main(int argc, char **argv)
     int fails = 0;
 
     printf("=== 1. NEON 高精度路径 (f32 量化) vs 标量参考: bit-exact ===\n");
-    for (int pat = 0; pat < 9; pat++) {
+    for (int pat = 0; pat < 10; pat++) {
         fc_f16 in[FC_ELEMS];
         static fc_block bn, br;
         gen(in, 0x1234567 + pat, pat);
@@ -136,7 +143,7 @@ int main(int argc, char **argv)
         long tot_dq = 0;
         int max_dq = 0, bad_step = 0;
         double worst_dsnr = 1e30;
-        for (int pat = 0; pat < 9; pat++) {
+        for (int pat = 0; pat < 10; pat++) {
             fc_f16 in[FC_ELEMS];
             fc_block bf, br;
             gen(in, 0x1234567 + pat, pat);
@@ -249,16 +256,24 @@ int main(int argc, char **argv)
             fc_decompress_neon(&cb[i], ob + (size_t)i * FC_ELEMS);
         }
 
-        /* 两段计时完全分开, 且结果被 checksum 消费, 编译器无法提升/融合 */
-        double t0 = now_s();
-        for (int k = 0; k < reps; k++)
-            for (int i = 0; i < nres; i++)
-                fc_compress_neon(arr + (size_t)i * FC_ELEMS, &cb[i]);
-        double t1 = now_s();
-        for (int k = 0; k < reps; k++)
-            for (int i = 0; i < nres; i++)
-                fc_decompress_neon(&cb[i], ob + (size_t)i * FC_ELEMS);
-        double t2 = now_s();
+        /* 两段计时完全分开, 且结果被 checksum 消费, 编译器无法提升/融合.
+         * 各跑 3 轮取最小: 单次计时受频率爬升/调度影响有 ±5% 抖动,
+         * 取最小后与 exp_opt.c 的多轮最小值可比. */
+        double tc = 1e9, td = 1e9;
+        for (int round = 0; round < 3; round++) {
+            double t0 = now_s();
+            for (int k = 0; k < reps; k++)
+                for (int i = 0; i < nres; i++)
+                    fc_compress_neon(arr + (size_t)i * FC_ELEMS, &cb[i]);
+            double t1 = now_s();
+            for (int k = 0; k < reps; k++)
+                for (int i = 0; i < nres; i++)
+                    fc_decompress_neon(&cb[i], ob + (size_t)i * FC_ELEMS);
+            double t2 = now_s();
+            if (t1 - t0 < tc) tc = t1 - t0;
+            if (t2 - t1 < td) td = t2 - t1;
+        }
+        double t0 = 0.0, t1 = tc, t2 = tc + td;
 
         uint64_t h = 0;
         for (int i = 0; i < nres; i++)
