@@ -66,11 +66,35 @@ void fc_compress_neon(const fc_f16 *restrict in, fc_block *restrict out);
  * 需要可复现的确定性编码 (落盘、校验、上游比对) 时用它 (代价: 编码慢约 1.9x). */
 void fc_compress_neon_hp(const fc_f16 *restrict in, fc_block *restrict out);
 
+/* 高质量路径: 网格 (min, step) 不再写死成"列最小值 + range/255", 而是逐列从
+ * FC_HQ_NSTEP*FC_HQ_NOFF 个候选里挑真实 SSE 最小的那个. 落盘格式与解码器
+ * 完全不变 (压缩率、解压速度都不变), 只有编码器变慢.
+ *
+ * 候选 k = si*FC_HQ_NOFF + j:
+ *   step_k = step0 的 bit pattern 挪 (si - FC_HQ_NSTEP/2) 个 ulp   (step0==0 时恒为 0)
+ *   min_k  = f16(min + Δ_j * step_k),  Δ_j = -1 + 2j/(FC_HQ_NOFF-1)
+ * FC_HQ_NOFF 取奇数, 于是 Δ=0 在候选集里; 配合 si=FC_HQ_NSTEP/2 时 step=step0,
+ * "现状网格" (min, f16(range/255)) 必定是候选之一 => HQ 的 SSE 不会劣于现状.
+ *
+ * 代价: 编码约 (1 + 8*候选数/7.25) 倍 —— 默认 27 候选 ≈ 30x (见 README 第 6 节).
+ * 想换挡就改这两个宏重新编译: 1x9 ≈ 10x, 3x9 ≈ 30x, 5x17 ≈ 100x.
+ *
+ * 注意本路径的 1/step 用 f32 除法再窄化 (确定性), 不用 FRECPE, 所以与
+ * fc_compress_ref_hq 可以做到 bit-exact; 前置条件与 fc_compress_neon 相同. */
+#ifndef FC_HQ_NSTEP
+#define FC_HQ_NSTEP 3
+#endif
+#ifndef FC_HQ_NOFF
+#define FC_HQ_NOFF 9
+#endif
+void fc_compress_neon_hq(const fc_f16 *restrict in, fc_block *restrict out);
+
 /* 解码: min/step 取 f16, q 拓宽到 f16 后用 FMA 一次成型 */
 void fc_decompress_neon(const fc_block *restrict in, fc_f16 *restrict out);
 
 /* 标量参考实现, 用于 bit-exact 对拍 */
 void fc_compress_ref(const fc_f16 *restrict in, fc_block *restrict out);
+void fc_compress_ref_hq(const fc_f16 *restrict in, fc_block *restrict out);
 void fc_decompress_ref(const fc_block *restrict in, fc_f16 *restrict out);
 
 #endif /* FCOMPRESS_H */

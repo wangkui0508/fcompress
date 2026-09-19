@@ -21,6 +21,14 @@ variants: bench_variants
 exp_opt: exp_opt.c fcompress_neon.c fcompress_ref.c fcompress.h
 	$(CC) $(CFLAGS) -I. -o $@ exp_opt.c fcompress_neon.c fcompress_ref.c $(LDFLAGS)
 
+# HQ 编码器: bit-exact 对拍 + 精度增益 + 编码耗时
+exp_hq: exp_hq.c fcompress_neon.c fcompress_ref.c fcompress.h
+	$(CC) $(CFLAGS) -I. -o $@ exp_hq.c fcompress_neon.c fcompress_ref.c $(LDFLAGS)
+
+.PHONY: hq
+hq: exp_hq
+	./exp_hq
+
 # 访存宽度微基准: 证明这个 kernel 是访存受限而不是浮点受限
 exp_ld: exp_ld.c fcompress.h
 	$(CC) $(CFLAGS) -I. -o $@ exp_ld.c $(LDFLAGS)
@@ -42,4 +50,4 @@ asm: fcompress_neon.c
 	$(CC) $(CFLAGS) -S -o - fcompress_neon.c | grep -E '^\s+(fmin|fmax|fmla|fmul|fsub|fdiv|ucvtf|fcvtn|fcvtl|xtn|shrn|ld1|st1)' | sort | uniq -c | sort -rn
 
 clean:
-	rm -f $(OBJS) test_fcompress bench_variants exp_opt exp_ld
+	rm -f $(OBJS) test_fcompress bench_variants exp_opt exp_ld exp_hq

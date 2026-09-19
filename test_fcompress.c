@@ -175,6 +175,49 @@ int main(int argc, char **argv)
         if (max_dq > 1 || bad_step) fails++;
     }
 
+    /* === 1c. HQ 路径 vs 标量 HQ 参考: bit-exact + 精度增益 ===
+     * HQ 只换编码器选的 (min, step), 格式与解码器不变, 所以能要求逐位一致. */
+    printf("\n=== 1c. HQ 路径 (搜最优网格) vs 标量 HQ 参考 ===\n");
+    {
+        long tot = 0;
+        int maxd = 0, bad_min = 0, bad_step = 0, worse = 0;
+        double worst_gain = 1e30, sum_gain = 0;
+        for (int pat = 0; pat < 10; pat++) {
+            fc_f16 in[FC_ELEMS];
+            static fc_block bh, br, bb;
+            static fc_f16 oh[FC_ELEMS], ob[FC_ELEMS];
+            gen(in, 0x1234567 + pat, pat);
+            fc_compress_neon_hq(in, &bh);
+            fc_compress_ref_hq(in, &br);
+            fc_compress_neon(in, &bb);
+            int nd = 0, md = 0;
+            for (int i = 0; i < FC_ELEMS; i++) {
+                int d = (int)bh.q[i] - (int)br.q[i];
+                if (d < 0) d = -d;
+                if (d) nd++;
+                if (d > md) md = d;
+                tot += d;
+            }
+            if (memcmp(bh.min, br.min, sizeof bh.min)) bad_min++;
+            if (memcmp(bh.step, br.step, sizeof bh.step)) bad_step++;
+            fc_decompress_neon(&bh, oh);
+            fc_decompress_neon(&bb, ob);
+            double gain = snr_db(in, oh) - snr_db(in, ob); /* 正 = HQ 更准 */
+            if (!(gain == gain) || fabs(gain) < 1e-9) gain = 0.0; /* inf-inf=nan: 完美重建 */
+
+            if (gain < worst_gain) worst_gain = gain;
+            sum_gain += gain;
+            if (gain < -1e-9) worse++;
+            if (md > maxd) maxd = md;
+            printf("  pattern %d: q 差异 %4d/1024 (max %d)  min %s step %s  HQ-现状 %+6.3f dB\n",
+                   pat, nd, md, bad_min ? "DIFF!" : "同", bad_step ? "DIFF!" : "同", gain);
+        }
+        printf("  -> Σ|Δq|=%ld, max|Δq|=%d, min/step %s, 平均增益 %+.3f dB, 最差块 %+.3f dB, 劣化块 %d\n",
+               tot, maxd, (bad_min || bad_step) ? "有差异!" : "逐位相同",
+               sum_gain / 10, worst_gain, worse);
+        if (maxd || bad_min || bad_step || worse) fails++;
+    }
+
     printf("\n=== 2. 列级重建边界检查 (pattern 1) ===\n");
     {
         fc_f16 in[FC_ELEMS], out[FC_ELEMS];
@@ -286,6 +329,20 @@ int main(int argc, char **argv)
         printf("  L2 常驻 %d 块 x %d 轮:\n", nres, reps);
         printf("    compress  : %8.2f ns/block  %6.2f GB/s  %5.3f ns/元素\n",
                (t1 - t0) / n * 1e9, bytes * n / (t1 - t0) / 1e9, (t1 - t0) / n * 1e9 / 1024.0);
+        {   /* HQ 编码器: 同一批数据, 编码变慢换精度 */
+            double th = 1e9;
+            for (int round = 0; round < 3; round++) {
+                double a0 = now_s();
+                for (int k = 0; k < reps / 8 + 1; k++)
+                    for (int i = 0; i < nres; i++)
+                        fc_compress_neon_hq(arr + (size_t)i * FC_ELEMS, &cb[i]);
+                double a1 = now_s();
+                if (a1 - a0 < th) th = a1 - a0;
+            }
+            long nh = (long)(reps / 8 + 1) * nres;
+            printf("    compress HQ: %7.1f ns/block  (%5.1fx 于快路径, 精度见 1c)\n",
+                   th / nh * 1e9, th / nh / ((t1 - t0) / n));
+        }
         printf("    decompress: %8.2f ns/block  %6.2f GB/s  %5.3f ns/元素\n",
                (t2 - t1) / n * 1e9, bytes * n / (t2 - t1) / 1e9, (t2 - t1) / n * 1e9 / 1024.0);
 

@@ -182,6 +182,23 @@ static void fc_quant_f16_fma(const float16_t *p, fc_block *out, const float16x8_
     }
 }
 
+/* 守卫 1/2 (两条路径共用):
+ * 守卫 1: 把 step==0 换成 65504 后取全部 32 列的最小值, 看 1/step 会不会溢出 f16.
+ * 守卫 2: 取全部 32 列 f16 域跨度 mx-mn 的最大值, 看它会不会溢出成 inf.
+ * inf 在 vmax 里会可靠地胜出, 所以不需要额外的 isinf 判断 (NaN 输入不支持). */
+static inline int fc_guard2(const float16x8_t mn[4], const float16x8_t mx[4],
+                            const float16x8_t step16[4])
+{
+    const float16x8_t big = vdupq_n_f16(FC_F16_MAX);
+    const float16x8_t zero16 = vdupq_n_f16(0.0f);
+    float16x8_t acc = big, rng = zero16;
+    for (int g = 0; g < 4; g++) {
+        acc = vminq_f16(acc, vbslq_f16(vceqq_f16(step16[g], zero16), big, step16[g]));
+        rng = vmaxq_f16(rng, vsubq_f16(mx[g], mn[g]));
+    }
+    return (float)vminvq_f16(acc) < FC_FAST_STEP_MIN || (float)vmaxvq_f16(rng) > FC_F16_MAX;
+}
+
 void fc_compress_neon(const fc_f16 *restrict in, fc_block *restrict out)
 {
     const float16_t *p = (const float16_t *)in;
@@ -195,19 +212,9 @@ void fc_compress_neon(const fc_f16 *restrict in, fc_block *restrict out)
     for (int g = 0; g < 4; g++)
         step16[g] = fc_step_store(mn, mx, out, g, &lo_mn[g], &hi_mn[g]);
 
-    /* 守卫 1: 把 step==0 换成 65504 后取全部 32 列的最小值, 看 1/step 会不会溢出 f16.
-     * 守卫 2: 取全部 32 列 f16 域跨度 mx-mn 的最大值, 看它会不会溢出成 inf. */
-    const float16x8_t big = vdupq_n_f16(FC_F16_MAX);
     const float16x8_t zero16 = vdupq_n_f16(0.0f);
-    float16x8_t acc = big, rng = zero16;
-    for (int g = 0; g < 4; g++) {
-        acc = vminq_f16(acc, vbslq_f16(vceqq_f16(step16[g], zero16), big, step16[g]));
-        /* inf 在 vmax 里会可靠地胜出, 所以不需要额外的 isinf 判断.
-         * (NaN 输入不支持, 见 fcompress.h, 不在守卫覆盖范围内) */
-        rng = vmaxq_f16(rng, vsubq_f16(mx[g], mn[g]));
-    }
 
-    if ((float)vminvq_f16(acc) < FC_FAST_STEP_MIN || (float)vmaxvq_f16(rng) > FC_F16_MAX) {
+    if (fc_guard2(mn, mx, step16)) {
         /* min/step 已在上面落盘, 这里只把量化域换回 f32 */
         for (int g = 0; g < 4; g++) {
             float32x4_t sl = vcvt_f32_f16(vget_low_f16(step16[g]));
@@ -265,6 +272,125 @@ void fc_compress_neon_hp(const fc_f16 *restrict in, fc_block *restrict out)
         hi_inv[g] = vbslq_f32(vceqq_f32(sh, zero), zero, vdivq_f32(one, sh));
     }
     fc_quant_f32(p, out, lo_mn, hi_mn, lo_inv, hi_inv);
+}
+
+/* ---------- 1/step: f32 除法版 (确定性, 可与标量参考 bit-exact) ----------
+ * 快路径用的是 FRECPE (实现定义, 快但不可复现); HQ 路径要能跟标量参考对拍,
+ * 所以这里用 vdivq_f32 再窄化 —— 每块只有几十条, 延迟还被后续计算盖住. */
+static inline float16x8_t fc_inv_div(const float16x8_t step16, const float32x4_t one)
+{
+    const float16x8_t zero16 = vdupq_n_f16(0.0f);
+    float32x4_t sl = vcvt_f32_f16(vget_low_f16(step16));
+    float32x4_t sh = vcvt_high_f32_f16(step16);
+    float16x8_t inv = vcombine_f16(vcvt_f16_f32(vdivq_f32(one, sl)),
+                                   vcvt_f16_f32(vdivq_f32(one, sh)));
+    return vbslq_f16(vceqq_f16(step16, zero16), zero16, inv);
+}
+
+/* 候选步长: 把 step0 的 bit pattern 挪 off 个 ulp (step0==0 时保持 0) */
+static inline float16x8_t fc_step_shift(const float16x8_t step0, int off)
+{
+    const float16x8_t zero16 = vdupq_n_f16(0.0f);
+    uint16x8_t bits = vreinterpretq_u16_f16(step0);
+    bits = (off >= 0) ? vaddq_u16(bits, vdupq_n_u16((uint16_t)off))
+                      : vsubq_u16(bits, vdupq_n_u16((uint16_t)(-off)));
+    return vbslq_f16(vceqq_f16(step0, zero16), zero16, vreinterpretq_f16_u16(bits));
+}
+
+void fc_compress_neon_hq(const fc_f16 *restrict in, fc_block *restrict out)
+{
+    const float16_t *p = (const float16_t *)in;
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float16x8_t zero16 = vdupq_n_f16(0.0f);
+
+    float16x8_t mn[4], mx[4], step16[4];
+    float32x4_t lo_mn[4], hi_mn[4];
+
+    fc_minmax(p, mn, mx);
+    for (int g = 0; g < 4; g++)
+        step16[g] = fc_step_store(mn, mx, out, g, &lo_mn[g], &hi_mn[g]);
+
+    /* 守卫 1/2 与快路径完全一致: 命中就整块退回 f32 量化 (用现状网格) */
+    if (fc_guard2(mn, mx, step16)) {
+        float32x4_t lo_inv[4], hi_inv[4];
+        for (int g = 0; g < 4; g++) {
+            float32x4_t sl = vcvt_f32_f16(vget_low_f16(step16[g]));
+            float32x4_t sh = vcvt_high_f32_f16(step16[g]);
+            lo_inv[g] = vbslq_f32(vceqq_f32(sl, vdupq_n_f32(0.0f)), vdupq_n_f32(0.0f),
+                                  vdivq_f32(one, sl));
+            hi_inv[g] = vbslq_f32(vceqq_f32(sh, vdupq_n_f32(0.0f)), vdupq_n_f32(0.0f),
+                                  vdivq_f32(one, sh));
+        }
+        fc_quant_f32(p, out, lo_mn, hi_mn, lo_inv, hi_inv);
+        return;
+    }
+
+    /* 搜索的求值一律用 sub+mul: 每候选多 1 条指令, 但它在任何 |min*inv| 下都准确.
+     * 若改用 FMA 求值, 带大 DC 偏置的块 (|min| 相对 range 很大, 仓库 bench 的
+     * pattern 1 就是) 会因加数抵消而把排序算错 —— 所以这条钱不能省. */
+
+    /* ---- 逐组 (8 列) 搜最优网格 ----
+     * 残差按 (v-r)*inv 归一化后再平方累加: 直接累加 (v-r)^2 会在小 range 列上
+     * 掉进 f16 次正规区甚至归零 (step=2e-5 时 e^2 ~ 1e-10, 远低于 f16 最小次正规
+     * 6e-8), 候选之间就没法区分了. 归一化后累加量恒在 O(1), 与数据量级无关. */
+    float16x8_t sel_inv[4], sel_bias[4], sel_min[4];
+    for (int g = 0; g < 4; g++) {
+        float16x8_t best_acc = vdupq_n_f16(FC_F16_MAX);
+        float16x8_t best_inv = zero16;
+        float16x8_t best_min = mn[g], best_step = step16[g];
+
+        for (int si = 0; si < FC_HQ_NSTEP; si++) {
+            float16x8_t stepc = fc_step_shift(step16[g], si - FC_HQ_NSTEP / 2);
+            float16x8_t inv = fc_inv_div(stepc, one);
+            float32x4_t scl = vcvt_f32_f16(vget_low_f16(stepc));
+            float32x4_t sch = vcvt_high_f32_f16(stepc);
+
+            /* 只留 minc 与 acc: 求值已改用 sub+mul, bias 不再进内层循环
+             * (少 9 个 live vector, 实测快 ~40%), 选完再算选中候选的 bias */
+            float16x8_t minc[FC_HQ_NOFF], acc[FC_HQ_NOFF];
+            for (int j = 0; j < FC_HQ_NOFF; j++) {
+                float delta = -1.0f + 2.0f * (float)j / (float)(FC_HQ_NOFF - 1);
+                float32x4_t t = vmulq_f32(vdupq_n_f32(delta), scl);
+                float32x4_t lo = vaddq_f32(lo_mn[g], t);
+                t = vmulq_f32(vdupq_n_f32(delta), sch);
+                float32x4_t hi = vaddq_f32(hi_mn[g], t);
+                minc[j] = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+                acc[j] = zero16;
+            }
+
+            for (int r = 0; r < FC_N; r++) {
+                float16x8_t v = vld1q_f16(p + r * FC_N + g * 8);
+                for (int j = 0; j < FC_HQ_NOFF; j++) {
+                    /* 用 sub+mul 求值 (不用 FMA): 多 1 条指令, 但任何 |min*inv| 下都准 */
+                    float16x8_t t = vmulq_f16(vsubq_f16(v, minc[j]), inv);
+                    uint16x8_t q = vminq_u16(vcvtnq_u16_f16(t), vdupq_n_u16(255));
+                    float16x8_t rr = vfmaq_f16(minc[j], vcvtq_f16_u16(q), stepc);
+                    float16x8_t e = vmulq_f16(vsubq_f16(v, rr), inv); /* 归一化残差 */
+                    acc[j] = vfmaq_f16(acc[j], e, e);
+                }
+            }
+
+            /* 归并: 严格小于才更新 (与标量参考的 "if (acc < best)" 同序, 平局取先者) */
+            for (int j = 0; j < FC_HQ_NOFF; j++) {
+                uint16x8_t better = vcltq_f16(acc[j], best_acc);
+                best_acc = vbslq_f16(better, acc[j], best_acc);
+                best_inv = vbslq_f16(better, inv, best_inv);
+                best_min = vbslq_f16(better, minc[j], best_min);
+                best_step = vbslq_f16(better, stepc, best_step);
+            }
+        }
+
+        sel_inv[g] = best_inv;
+        sel_min[g] = best_min;
+        sel_bias[g] = vnegq_f16(vmulq_f16(best_min, best_inv)); /* 选中后再算, 与标量参考同式 */
+        vst1q_f16((float16_t *)out->min + g * 8, best_min);
+        vst1q_f16((float16_t *)out->step + g * 8, best_step);
+    }
+    /* 最终量化一律用 sub+mul: 与搜索时的求值形式完全一致, 于是"选中的候选"
+     * 的实际 SSE == 评估出来的 SSE. 又因为现状网格 (min, step0) 也在候选集里,
+     * HQ 的 SSE 严格 <= 现状网格的 SSE —— "永不劣化"是结构性保证, 不是实测巧合.
+     * (FMA 那条指令省下来也没意义: 最终量化只占 HQ 的百分之几) */
+    fc_quant_f16_sub(p, out, sel_min, sel_inv);
 }
 
 void fc_decompress_neon(const fc_block *restrict in, fc_f16 *restrict out)
